@@ -72,6 +72,8 @@ DUAL_SCRIPT_FONTS = {
     'Pretendard', 'Pretendard Thin', 'Pretendard ExtraLight', 'Pretendard Light',
     'Pretendard Medium', 'Pretendard SemiBold', 'Pretendard ExtraBold',
     'Pretendard Black', 'Pretendard JP', 'Pretendard GOV',
+    'Gmarket Sans TTF Medium', 'G마켓 산스 TTF Medium',
+    'Gmarket Sans TTF Bold', 'G마켓 산스 TTF Bold',
 }
 
 # macOS/Linux-only fonts -> Windows equivalents
