@@ -6,6 +6,18 @@ standing repository conventions. Route selection belongs to
 After routing, the selected skill or workflow owns execution and gates. The rules
 below add Codex-side enforcement; they never override the selected owner.
 
+## Project-local Python environment
+
+- Use the repository's `.venv` for every Python script and package installation,
+  including in new chats opened in this repository.
+- On Windows, invoke `.\.venv\Scripts\python.exe` explicitly. Replace documented
+  `python` / `python3` commands with this interpreter, and use
+  `.\.venv\Scripts\python.exe -m pip` instead of bare `pip`. Do not rely on
+  activation persisting between terminals or tool calls.
+- If `.venv` is missing, create it with `python -m venv .venv`, then install
+  requirements with `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`.
+  Do not install this project's packages into system or user Python environments.
+
 ## Skill source (generated pointer stubs)
 
 - **`.claude/skills/` is canonical** (`ppt-master`, `ppt-template-fill`,
@@ -21,8 +33,8 @@ below add Codex-side enforcement; they never override the selected owner.
   the main SVG skill for a direct-PPTX route.
 - Path resolution: `${SKILL_DIR}` and bare relative paths (`references/...`,
   `workflows/...`, `scripts/...`, `templates/...`) resolve against the canonical
-  skill directory. Run all commands from the repository root. If `python3` is
-  missing (common on Windows), rerun the same command with `python`.
+  skill directory. Run all commands from the repository root, using the
+  project-local Python interpreter specified above.
 
 ## PPT requests — MANDATORY procedure
 
