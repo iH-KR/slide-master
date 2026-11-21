@@ -27,7 +27,8 @@ class ServerLifecycleTests(unittest.TestCase):
     def test_identity_checks_project_service_and_child(self):
         for overrides, expected in [({}, True), ({'project': '/other'}, False),
                                     ({'service': 'confirm-ui'}, False),
-                                    ({'pid': 456}, False), ({'status': 'bad'}, False),
+                                    ({'pid': 456}, False), ({'pid': 456, 'ppid': 123}, True),
+                                    ({'pid': 456, 'ppid': 789}, False), ({'status': 'bad'}, False),
                                     ({'project': ''}, False)]:
             with self.subTest(overrides=overrides), patch.object(
                     common, '_health_opener', return_value=MagicMock(

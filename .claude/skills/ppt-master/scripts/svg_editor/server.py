@@ -104,6 +104,13 @@ from svg_to_pptx.geometry_properties import (  # noqa: E402
     materialize_inline_geometry_properties,
 )
 from update_spec import lock_revision, parse_lock  # noqa: E402
+from total_md_split import (  # noqa: E402
+    HEADING_RE as _NOTES_HEADING_RE,
+    HR_RE as _NOTES_HR_RE,
+    build_match_maps,
+    match_title,
+    parse_total_md,
+)
 
 _ICONS_DIR = _SCRIPTS_DIR.parent.parent / 'templates' / 'icons'
 _USE_ICON_PATTERN = re.compile(r'<use\s+[^>]*data-icon="[^"]*"[^>]*/>')
@@ -315,6 +322,200 @@ def _append_edit_log(project_path: Path, record: dict) -> None:
 def _append_annotation_log(project_path: Path, record: dict) -> None:
     """Append one annotation lifecycle record to the preview history."""
     _append_live_preview_log(project_path, ANNOTATION_LOG_NAME, record)
+
+
+# Speaker notes: notes/total.md is the source of truth (Step 7.1 splits it into
+# notes/<stem>.md). Editor writes update both so a later split cannot revert them.
+NOTES_DIR_NAME = 'notes'
+TOTAL_NOTES_NAME = 'total.md'
+_MAX_NOTES_LEN = 20000
+
+
+def _normalize_notes_text(text: str) -> str:
+    """Normalize line endings and trailing whitespace of a notes body."""
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    return '\n'.join(line.rstrip() for line in lines).strip()
+
+
+def _read_slide_notes(project_path: Path, stem: str, svg_stems: list[str]) -> tuple[str, str]:
+    """Return ``(notes_text, source)``; source is ``total``, ``file`` or ``none``."""
+    notes_dir = project_path / NOTES_DIR_NAME
+    total_md = notes_dir / TOTAL_NOTES_NAME
+    if total_md.is_file():
+        sections = parse_total_md(total_md, svg_stems, verbose=False)
+        if stem in sections:
+            return sections[stem], 'total'
+    per_slide = notes_dir / f'{stem}.md'
+    if per_slide.is_file():
+        return per_slide.read_text(encoding='utf-8').strip(), 'file'
+    return '', 'none'
+
+
+def _replace_total_md_section(
+    content: str,
+    stem: str,
+    text: str,
+    svg_stems: list[str],
+) -> str:
+    """Replace the body under the heading matching ``stem``; append it if absent.
+
+    The section's trailing separator (blank lines and ``---``) is preserved so
+    the file layout written by the notes generator stays intact.
+    """
+    exact, norm_map, num_map = build_match_maps(svg_stems)
+    lines = content.split('\n')
+    headings: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        match = _NOTES_HEADING_RE.match(line)
+        if not match:
+            continue
+        matched = match_title(match.group(2).strip(), exact, norm_map, num_map, svg_stems)
+        if matched:
+            headings.append((index, matched))
+
+    body = text.split('\n') if text else []
+    for pos, (start, matched) in enumerate(headings):
+        if matched != stem:
+            continue
+        end = headings[pos + 1][0] if pos + 1 < len(headings) else len(lines)
+        body_end = end
+        while body_end > start + 1 and (
+            not lines[body_end - 1].strip() or _NOTES_HR_RE.match(lines[body_end - 1])
+        ):
+            body_end -= 1
+        tail = lines[body_end:end]
+        return '\n'.join(lines[:start + 1] + [''] + body + tail + lines[end:])
+
+    base = content.rstrip('\n')
+    separator = '\n\n---\n\n' if base else ''
+    return f'{base}{separator}# {stem}\n\n{text}\n'
+
+
+def _newline_style(path: Path, fallback: str = '\n') -> str:
+    """Return the line ending an existing file uses, so rewrites keep its style."""
+    try:
+        return '\r\n' if b'\r\n' in path.read_bytes() else '\n'
+    except OSError:
+        return fallback
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    """Write via a temp file in the same folder, then swap it in with ``os.replace``.
+
+    A failed write leaves the original file untouched instead of truncated.
+    """
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _encode_text(text: str, newline: str) -> bytes:
+    return text.replace('\n', newline).encode('utf-8')
+
+
+def _write_slide_notes(project_path: Path, stem: str, text: str, svg_stems: list[str]) -> str:
+    """Write one slide's notes; returns ``total`` or ``file`` (where the source lives).
+
+    Both files are replaced atomically. If ``notes/<stem>.md`` cannot be written
+    after ``total.md`` was updated, ``total.md`` is restored and the error is
+    re-raised, so the caller can keep the notes staged and retry.
+    """
+    notes_dir = project_path / NOTES_DIR_NAME
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    total_md = notes_dir / TOTAL_NOTES_NAME
+    per_slide = notes_dir / f'{stem}.md'
+    source = 'file'
+    newline = '\n'
+    total_original: Optional[bytes] = None
+    if total_md.is_file():
+        newline = _newline_style(total_md)
+        total_original = total_md.read_bytes()
+        content = total_md.read_text(encoding='utf-8')
+        updated = _replace_total_md_section(content, stem, text, svg_stems)
+        _write_bytes_atomic(total_md, _encode_text(updated, newline))
+        source = 'total'
+    try:
+        _write_bytes_atomic(per_slide, _encode_text(text, _newline_style(per_slide, newline)))
+    except OSError as exc:
+        if total_original is not None:
+            try:
+                _write_bytes_atomic(total_md, total_original)
+            except OSError as restore_exc:
+                raise OSError(
+                    f'{exc}; restoring {TOTAL_NOTES_NAME} also failed: {restore_exc}'
+                ) from exc
+        raise
+    return source
+
+
+def _retarget_total_md(
+    project_path: Path,
+    old_stems: list[str],
+    new_order: list[tuple[str, str]],
+) -> dict[str, str]:
+    """Rewrite ``notes/total.md`` after pages were reordered or deleted.
+
+    ``new_order`` lists ``(old_stem, new_stem)`` for every kept page in its new
+    order. Matched sections get the new stem as heading and follow that order;
+    sections of deleted pages are dropped and returned as ``{old_stem: body}``
+    so the caller can keep them with the page backup. Headings that match no
+    page stay at the end unchanged. Without this, the next Step 7.1 split would
+    pair the old headings with the renumbered pages.
+    """
+    total_md = project_path / NOTES_DIR_NAME / TOTAL_NOTES_NAME
+    if not total_md.is_file():
+        return {}
+    newline = _newline_style(total_md)
+    lines = total_md.read_text(encoding='utf-8').split('\n')
+    exact, norm_map, num_map = build_match_maps(old_stems)
+    starts: list[tuple[int, Optional[str], str]] = []
+    for index, line in enumerate(lines):
+        match = _NOTES_HEADING_RE.match(line)
+        if match:
+            stem = match_title(match.group(2).strip(), exact, norm_map, num_map, old_stems)
+            starts.append((index, stem, match.group(1)))
+    if not starts:
+        return {}
+
+    sections: dict[str, tuple[str, list[str]]] = {}
+    unmatched: list[list[str]] = []
+    for pos, (start, stem, marker) in enumerate(starts):
+        end = starts[pos + 1][0] if pos + 1 < len(starts) else len(lines)
+        body = lines[start + 1:end]
+        while body and (not body[-1].strip() or _NOTES_HR_RE.match(body[-1])):
+            body.pop()
+        while body and not body[0].strip():
+            body.pop(0)
+        if stem is None or stem in sections:
+            unmatched.append([lines[start]] + ([''] + body if body else []))
+        else:
+            sections[stem] = (marker, body)
+
+    blocks: list[list[str]] = []
+    for old_stem, new_stem in new_order:
+        if old_stem in sections:
+            marker, body = sections.pop(old_stem)
+            blocks.append([f'{marker} {new_stem}'] + ([''] + body if body else []))
+    blocks += unmatched
+
+    separator = ['', '---', ''] if any(_NOTES_HR_RE.match(line) for line in lines) else ['']
+    out = lines[:starts[0][0]]
+    while out and not out[-1].strip():
+        out.pop()
+    if out:
+        out.append('')
+    for pos, block in enumerate(blocks):
+        if pos:
+            out += separator
+        out += block
+    _write_bytes_atomic(total_md, _encode_text('\n'.join(out) + '\n', newline))
+    return {stem: '\n'.join(body) for stem, (_, body) in sections.items()}
 
 
 def _find_by_id(root: ET.Element, element_id: str) -> Optional[ET.Element]:
@@ -637,6 +838,10 @@ def create_app(
     # Staged page order (pages left out are deleted), applied by /api/save-all.
     app.config['PAGE_PLAN'] = None
 
+    # Staged speaker-notes bodies: {filename: text}. Written by /api/save-all.
+    app.config['PENDING_NOTES'] = {}
+    notes_lock = threading.Lock()
+
     # Idle timeout: auto-shutdown if no one connects within idle_timeout seconds
     app.config['LAST_REQUEST_TIME'] = time.time()
 
@@ -751,6 +956,7 @@ def create_app(
             'status': 'ok',
             'service': 'svg-editor',
             'pid': os.getpid(),
+            'ppid': os.getppid(),
             'project': str(project_path),
             'live': app.config['LIVE_MODE'],
             'svg_output': str(svg_dir),
@@ -857,6 +1063,10 @@ def create_app(
                 'name': svg_file.name,
                 'annotated': annotation_count > 0,
                 'annotation_count': annotation_count,
+                # Staged-but-unapplied state, so a reloaded tab can still mark
+                # pending slides in the list and the pending strip.
+                'pending_edits': len(app.config['PENDING_EDITS'].get(svg_file.name) or []),
+                'notes_pending': svg_file.name in app.config['PENDING_NOTES'],
                 'ok': ok,
                 'error': error_msg,
                 'mtime': mtime,
@@ -965,6 +1175,66 @@ def create_app(
             'mtime': mtime,
             'undo_depth': len(pending_edits),
         })
+
+    def _svg_stems() -> list[str]:
+        return [p.stem for p in sorted(svg_dir.glob('*.svg'))] if svg_dir.exists() else []
+
+    @app.route('/api/slide/<name>/notes')
+    def get_notes(name: str):
+        """Return the slide's speaker notes (staged text wins over disk)."""
+        svg_file = _safe_svg_path(name)
+        if svg_file is None:
+            return jsonify({'error': 'Invalid slide name'}), 400
+        if not svg_file.exists():
+            return jsonify({'error': 'Slide not found'}), 404
+        try:
+            disk_text, source = _read_slide_notes(project_path, svg_file.stem, _svg_stems())
+        except OSError as exc:
+            return jsonify({'error': f'Failed to read speaker notes: {exc}'}), 500
+        pending = app.config['PENDING_NOTES']
+        staged = name in pending
+        resp = jsonify({
+            'name': name,
+            'notes': pending[name] if staged else disk_text,
+            'staged': staged,
+            'source': source,
+            'file': f'{svg_file.stem}.md',
+        })
+        resp.headers['Cache-Control'] = 'no-store'
+        return resp
+
+    @app.route('/api/slide/<name>/notes', methods=['POST'])
+    def post_notes(name: str):
+        """Stage a speaker-notes body; disk writes happen in /api/save-all."""
+        svg_file = _safe_svg_path(name)
+        if svg_file is None:
+            return jsonify({'error': 'Invalid slide name'}), 400
+        if not svg_file.exists():
+            return jsonify({'error': 'Slide not found'}), 404
+        data = request.get_json(silent=True) or {}
+        text = data.get('notes')
+        if not isinstance(text, str) or len(text) > _MAX_NOTES_LEN:
+            return jsonify({'error': f'notes must be a string (max {_MAX_NOTES_LEN} chars)'}), 400
+        text = _normalize_notes_text(text)
+        for line in text.split('\n'):
+            if _NOTES_HEADING_RE.match(line):
+                return jsonify({
+                    'error': 'Speaker notes cannot contain lines starting with "#" '
+                             '(they would split notes/total.md). Remove the leading "#".',
+                }), 400
+        # Same lock as save-all: a stage that arrives mid-save waits, then
+        # compares against the freshly written disk text, so it is never lost.
+        with notes_lock:
+            try:
+                disk_text, _ = _read_slide_notes(project_path, svg_file.stem, _svg_stems())
+            except OSError as exc:
+                return jsonify({'error': f'Failed to read speaker notes: {exc}'}), 500
+            pending = app.config['PENDING_NOTES']
+            if text == _normalize_notes_text(disk_text):
+                pending.pop(name, None)
+            else:
+                pending[name] = text
+            return jsonify({'status': 'ok', 'staged': name in pending, 'pending_notes': len(pending)})
 
     @app.route('/api/slide/<name>/annotate', methods=['POST'])
     def post_annotate(name: str):
@@ -1243,6 +1513,13 @@ def create_app(
         if clash:
             raise FileExistsError(f'page rename target already exists: {clash[0]}')
 
+        # total.md first: if it cannot be rewritten, nothing has moved yet.
+        dropped_notes = _retarget_total_md(
+            project_path,
+            [Path(name).stem for name in current],
+            [(Path(name).stem, Path(renamed.get(name, name)).stem) for name in order],
+        )
+
         stamp = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
         for name in deleted:
             _store_version(project_path, name, (svg_dir / name).read_bytes())
@@ -1252,6 +1529,9 @@ def create_app(
             notes = notes_dir / f'{Path(name).stem}.md'
             if notes.exists():
                 notes.rename(kept / notes.name)
+            elif Path(name).stem in dropped_notes:
+                # Notes that lived only in total.md go to the page backup too.
+                (kept / notes.name).write_text(dropped_notes[Path(name).stem], encoding='utf-8')
             (svg_dir / name).unlink()
             _append_edit_log(project_path, {
                 'ts': time.time(), 'file': name, 'action': 'page_delete', 'kept_in': str(kept),
@@ -1286,6 +1566,34 @@ def create_app(
                 app.config['PAGE_PLAN'] = None
                 return jsonify({'error': 'Pages changed on disk since the page order was '
                                          'staged; nothing was written. Stage it again.'}), 409
+
+        # Notes first: a write failure here aborts before any SVG is touched.
+        # Each entry leaves the staging dict only after its own write succeeds;
+        # a failed slide (and every slide after it) stays staged for a retry.
+        notes_modified = []
+        with notes_lock:
+            pending_notes = app.config['PENDING_NOTES']
+            stems = _svg_stems() if pending_notes else []
+            for filename in sorted(pending_notes):
+                svg_file = _safe_svg_path(filename)
+                if svg_file is None or not svg_file.exists():
+                    pending_notes.pop(filename, None)
+                    continue
+                new_text = pending_notes[filename]
+                try:
+                    old_text, _ = _read_slide_notes(project_path, svg_file.stem, stems)
+                    target = _write_slide_notes(project_path, svg_file.stem, new_text, stems)
+                except OSError as exc:
+                    return jsonify({
+                        'error': f'Failed to write speaker notes for {filename}: {exc}',
+                    }), 500
+                del pending_notes[filename]
+                _append_edit_log(project_path, {
+                    'ts': time.time(), 'file': filename, 'element_id': None,
+                    'action': 'notes_edit', 'kind': 'notes', 'key': target,
+                    'old': old_text, 'new': new_text,
+                })
+                notes_modified.append(filename)
 
         filenames = sorted(set(annotations.keys()) | set(pending_edits.keys()))
         for filename in filenames:
@@ -1388,7 +1696,8 @@ def create_app(
                 logger.warning('page plan record failed: %s', exc)
 
         return jsonify({'status': 'ok', 'files_modified': modified,
-                        'renamed': renamed, 'deleted': deleted})
+                        'renamed': renamed, 'deleted': deleted,
+                        'notes_modified': notes_modified})
 
     return app
 

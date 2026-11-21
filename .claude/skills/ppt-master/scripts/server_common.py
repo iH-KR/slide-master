@@ -68,7 +68,10 @@ def probe_server(port: int, project: Path, service: str,
         return (data.get('status') == 'ok'
                 and data.get('service', legacy_service) == service
                 and Path(data.get('project', '')).resolve() == project.resolve()
-                and (expected_pid is None or data.get('pid') == expected_pid))
+                # A Windows venv python.exe is a launcher that starts the real
+                # interpreter as its child, so the server's pid differs from
+                # Popen's; its parent pid still identifies our child.
+                and (expected_pid is None or expected_pid in (data.get('pid'), data.get('ppid'))))
     except (OSError, urllib.error.URLError) as exc:
         if _permission_denied(exc):
             raise _permission_error(exc) from exc

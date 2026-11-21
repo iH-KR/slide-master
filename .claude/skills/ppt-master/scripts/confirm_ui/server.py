@@ -945,6 +945,7 @@ def create_app(
             'status': 'ok',
             'service': 'confirm-ui',
             'pid': os.getpid(),
+            'ppid': os.getppid(),
             'project': str(project_path),
             'recommendations': rec_ok,
             'stage': stage,
