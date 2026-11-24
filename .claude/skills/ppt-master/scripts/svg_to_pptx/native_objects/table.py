@@ -886,9 +886,15 @@ def _build_native_table(elem: ET.Element, ctx: ConvertContext, payload: dict[str
             if merge_region is not None and (
                 row_idx != merge_region.row or col_idx != merge_region.col
             ):
+                # Covered cells still feed PowerPoint's row-height floor; an
+                # empty paragraph with no end-run size falls back to 18pt.
+                covered_paragraph = (
+                    "<a:p/>" if preserve_source_style
+                    else f'<a:p><a:endParaRPr sz="{body_font_size}"/></a:p>'
+                )
                 cells_xml.append(
                     f'<a:tc{merge_attrs}>'
-                    '<a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody>'
+                    f'<a:txBody><a:bodyPr/><a:lstStyle/>{covered_paragraph}</a:txBody>'
                     '<a:tcPr/>'
                     '</a:tc>'
                 )
@@ -961,8 +967,12 @@ def _build_native_table(elem: ET.Element, ctx: ConvertContext, payload: dict[str
                     language=language,
                     theme_color_spec=ctx.theme_color_spec,
                 )
+                end_props = (
+                    f'<a:endParaRPr sz="{cell_font_size}"/>'
+                    if cell_font_size is not None else ""
+                )
                 paragraphs_xml = (
-                    f"<a:p>{paragraph_props}{text_run_xml}</a:p>"
+                    f"<a:p>{paragraph_props}{text_run_xml}{end_props}</a:p>"
                 )
             else:
                 paragraph_parts: list[str] = []
@@ -1005,8 +1015,12 @@ def _build_native_table(elem: ET.Element, ctx: ConvertContext, payload: dict[str
                             )
                             for run in paragraph.runs
                         )
+                    end_props = (
+                        f'<a:endParaRPr sz="{cell_font_size}"/>'
+                        if cell_font_size is not None else ""
+                    )
                     paragraph_parts.append(
-                        f"<a:p>{paragraph_props}{text_run_xml}</a:p>"
+                        f"<a:p>{paragraph_props}{text_run_xml}{end_props}</a:p>"
                     )
                 paragraphs_xml = "".join(paragraph_parts)
             anchor_keys = {"valign", "vertical_align"}
